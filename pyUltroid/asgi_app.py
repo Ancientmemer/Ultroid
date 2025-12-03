@@ -1,51 +1,95 @@
 # pyUltroid/asgi_app.py
 import os
 import asyncio
-import signal
 import subprocess
-from fastapi import FastAPI
+import signal
+from threading import Thread
 
-app = FastAPI()
 _subproc = None
+_started = False
 
-@app.get("/")
-async def root():
-    return {"status": "Ultroid ASGI alive"}
+# Simple ASGI app (no FastAPI / pydantic)
+async def app(scope, receive, send):
+    global _started
+    if scope["type"] == "lifespan":
+        while True:
+            msg = await receive()
+            if msg["type"] == "lifespan.startup":
+                # Start subprocess once at startup
+                if not _started:
+                    _started = True
+                    start_subprocess()
+                await send({"type": "lifespan.startup.complete"})
+            elif msg["type"] == "lifespan.shutdown":
+                stop_subprocess()
+                await send({"type": "lifespan.shutdown.complete"})
+                return
+    elif scope["type"] == "http":
+        path = scope.get("path", "/")
+        if path == "/":
+            body = b'{"status":"Ultroid ASGI alive"}'
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
+        if path == "/health":
+            body = b'{"ok": true}'
+            await send({
+                "type": "http.response.start",
+                "status": 200,
+                "headers": [
+                    (b"content-type", b"application/json"),
+                ],
+            })
+            await send({"type": "http.response.body", "body": body})
+            return
 
-@app.get("/health")
-async def health():
-    return {"ok": True}
+        # 404 for everything else
+        body = b'{"error":"not found"}'
+        await send({
+            "type": "http.response.start",
+            "status": 404,
+            "headers": [
+                (b"content-type", b"application/json"),
+            ],
+        })
+        await send({"type": "http.response.body", "body": body})
+    else:
+        # other ASGI scopes not handled
+        return
 
-@app.on_event("startup")
-async def startup_event():
+def _stream_stdout(proc):
+    if proc.stdout is None:
+        return
+    for line in proc.stdout:
+        print("[ultroid subprocess]", line.rstrip())
+
+def start_subprocess():
     global _subproc
     if _subproc is not None:
         return
-
     cmd = ["python", "-m", "pyUltroid"]
     env = os.environ.copy()
-
-    # start Ultroid as child process so uvicorn remains the main PID 1
+    # Start Ultroid subprocess
     _subproc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         text=True,
         env=env,
-        bufsize=1
+        bufsize=1,
     )
+    # Stream stdout in background thread (so it doesn't block event loop)
+    t = Thread(target=_stream_stdout, args=(_subproc,), daemon=True)
+    t.start()
+    print("Started ultroid subprocess, PID:", _subproc.pid)
 
-    # stream child stdout to container logs without blocking event loop
-    loop = asyncio.get_event_loop()
-    def _stream():
-        if _subproc.stdout is None:
-            return
-        for line in _subproc.stdout:
-            print("[ultroid subprocess]", line.rstrip())
-    loop.run_in_executor(None, _stream)
-
-@app.on_event("shutdown")
-async def shutdown_event():
+def stop_subprocess():
     global _subproc
     if not _subproc:
         return
@@ -64,3 +108,5 @@ async def shutdown_event():
             _subproc.kill()
         except Exception:
             pass
+    print("Ultroid subprocess stopped")
+    _subproc = None
