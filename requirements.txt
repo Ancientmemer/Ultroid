@@ -10,3 +10,5 @@ requests
 aiohttp
 catbox-uploader
 cloudscraper
+fastapi
+uvicorn[standard]
